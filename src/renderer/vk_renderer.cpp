@@ -4,6 +4,9 @@
 #include <Windows.h>
 #include <wtypes.h>
 #include "platform.h"
+#include "utils/dds.h"
+#include "utils/vk_types.h"
+
 #define VK_CHECK(result)                \
     if(result!=VK_SUCCESS){             \
         std::cout<<result<<std::endl;   \
@@ -33,6 +36,11 @@ struct VkContext{
     VkDebugUtilsMessengerEXT debugMessenger;
     VkSurfaceFormatKHR surfaceFormat;
 
+    Image image;
+
+    Buffer stagingBuffer;
+
+    //TODO: abstract
     VkPipeline pipeline;
     VkPipelineLayout pipelineLayout;
 
@@ -283,7 +291,12 @@ bool vk_init(VkContext *vkcontext, void *window){
       
     }
 
-    //Layout
+    //descriptor set kayout
+    {
+        //vkCreateDescriptorSetLayout
+    }
+
+    //Pipeline Layout
     {
         VkPipelineLayoutCreateInfo layoutInfo={};
         layoutInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -413,6 +426,112 @@ bool vk_init(VkContext *vkcontext, void *window){
         
         VK_CHECK(vkCreateSemaphore(vkcontext->device,&semaphoreInfo,0,&vkcontext->aquireSemaphore));
         VK_CHECK(vkCreateSemaphore(vkcontext->device,&semaphoreInfo,0,&vkcontext->submitSemaphore));
+    }
+
+    //staging buffer
+    {
+        VkBufferCreateInfo bufferInfo={};
+        bufferInfo.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bufferInfo.size=MB(1);
+        VK_CHECK(vkCreateBuffer(vkcontext->device,&bufferInfo,0,&vkcontext->stagingBuffer.buffer));
+    
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(vkcontext->device,vkcontext->stagingBuffer.buffer,&memRequirements);
+
+        VkPhysicalDeviceMemoryProperties gpuMemProps;
+        vkGetPhysicalDeviceMemoryProperties(vkcontext->gpu,&gpuMemProps);
+        
+        VkMemoryAllocateInfo allocInfo={};
+        allocInfo.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize=MB(1);
+        
+        for (uint32_t i = 0; i < gpuMemProps.memoryTypeCount; i++)
+        {
+            if(memRequirements.memoryTypeBits & (1<<i) && 
+            (gpuMemProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)==
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT){
+                allocInfo.memoryTypeIndex=i;
+            }
+        }
+
+        VK_CHECK(vkAllocateMemory(vkcontext->device,&allocInfo,0,&vkcontext->stagingBuffer.memory));
+        VK_CHECK(vkMapMemory(vkcontext->device,vkcontext->stagingBuffer.memory,0,MB(1),0,&vkcontext->stagingBuffer.data));
+        VK_CHECK(vkBindBufferMemory(vkcontext->device,vkcontext->stagingBuffer.buffer,vkcontext->stagingBuffer.memory,0));
+    }
+
+    //load image
+    {
+
+        uint32_t fileSize;
+        DDSFile *data=(DDSFile *)platform_read_file("assets/textures/ship.dds",&fileSize);
+
+        uint32_t textureSize=data->header.Width*data->header.Height*4;// 4 coz r 8bits g 8bits b 8bits a 8bits i.e. 32 bits=4bytes
+
+        //copy data into staging buffer
+        memcpy(vkcontext->stagingBuffer.data,&data->dataBegin,textureSize);
+
+        //TODO: assertions
+
+        VkImageCreateInfo imgInfo={};
+        imgInfo.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imgInfo.mipLevels=1;
+        imgInfo.arrayLayers=1;
+        imgInfo.imageType=VK_IMAGE_TYPE_2D;
+        imgInfo.format=VK_FORMAT_R8G8B8A8_UNORM;
+        imgInfo.extent={data->header.Width,data->header.Height,1};
+        imgInfo.samples=VK_SAMPLE_COUNT_1_BIT;//1 time sample no avg
+        imgInfo.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+        imgInfo.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+
+        VK_CHECK(vkCreateImage(vkcontext->device,&imgInfo,0,&vkcontext->image.image));
+
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(vkcontext->device,vkcontext->image.image,&memRequirements);
+
+        VkPhysicalDeviceMemoryProperties gpuMemProps;
+        vkGetPhysicalDeviceMemoryProperties(vkcontext->gpu,&gpuMemProps);
+        
+        VkMemoryAllocateInfo allocInfo={};
+        
+        for (uint32_t i = 0; i < gpuMemProps.memoryTypeCount; i++)
+        {
+            if(memRequirements.memoryTypeBits & (1<<i) && 
+            (gpuMemProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)==VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT){
+                allocInfo.memoryTypeIndex=i;
+            }
+        }
+        
+
+        
+        allocInfo.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize=textureSize;
+      
+        VK_CHECK(vkAllocateMemory(vkcontext->device,&allocInfo,0,&vkcontext->image.memory));
+        VK_CHECK(vkBindImageMemory(vkcontext->device,vkcontext->image.image,vkcontext->image.memory,0));
+
+
+        VkCommandBuffer cmd;
+        VkCommandBufferAllocateInfo cmdallocInfo={};
+        cmdallocInfo.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmdallocInfo.commandBufferCount=1;
+        cmdallocInfo.commandPool=vkcontext->commandPool;
+        VK_CHECK(vkAllocateCommandBuffers(vkcontext->device,&cmdallocInfo,&cmd));
+    
+        VkCommandBufferBeginInfo cmdBeginInfo={};
+        cmdBeginInfo.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        cmdBeginInfo.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        VK_CHECK(vkBeginCommandBuffer(cmd,&cmdBeginInfo));
+
+        VkBufferImageCopy copyRegion={};
+        copyRegion.imageExtent={data->header.Width,data->header.Height,1};
+        copyRegion.imageSubresource.layerCount=1;
+        copyRegion.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+
+        vkCmdCopyBufferToImage(cmd,vkcontext->stagingBuffer.buffer,vkcontext->image.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copyRegion);
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        vkDeviceWaitIdle(vkcontext->device);
     }
     
     return true;
