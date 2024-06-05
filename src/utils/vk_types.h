@@ -4,6 +4,7 @@
 
 struct Image{
     VkImage image;
+    VkImageView view;
     VkDeviceMemory memory;
 
 };

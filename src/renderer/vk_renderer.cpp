@@ -6,6 +6,7 @@
 #include "platform.h"
 #include "utils/dds.h"
 #include "utils/vk_types.h"
+#include "utils/vk_init.h"
 
 #define VK_CHECK(result)                \
     if(result!=VK_SUCCESS){             \
@@ -40,9 +41,17 @@ struct VkContext{
 
     Buffer stagingBuffer;
 
+    VkDescriptorPool descriptorPool;
+
+    VkSampler sampler;
+
+
+    VkDescriptorSet descSet;
+    VkDescriptorSetLayout setLayout;
     //TODO: abstract
     VkPipeline pipeline;
     VkPipelineLayout pipelineLayout;
+
 
     int graphicsIdx=-1;
 
@@ -291,16 +300,27 @@ bool vk_init(VkContext *vkcontext, void *window){
       
     }
 
-    //descriptor set kayout
+    //descriptor set layout
     {
-        //vkCreateDescriptorSetLayout
+        VkDescriptorSetLayoutBinding binding={};
+        binding.binding=0;
+        binding.descriptorCount=1;
+        binding.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo={};
+        layoutInfo.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount=1;
+        layoutInfo.pBindings=&binding;
+        VK_CHECK(vkCreateDescriptorSetLayout(vkcontext->device,&layoutInfo,0,&vkcontext->setLayout));
     }
 
     //Pipeline Layout
     {
         VkPipelineLayoutCreateInfo layoutInfo={};
         layoutInfo.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-
+        layoutInfo.setLayoutCount=1;
+        layoutInfo.pSetLayouts=&vkcontext->setLayout;
         VK_CHECK(vkCreatePipelineLayout(vkcontext->device,&layoutInfo,0,&vkcontext->pipelineLayout));
     }
 
@@ -450,7 +470,7 @@ bool vk_init(VkContext *vkcontext, void *window){
         {
             if(memRequirements.memoryTypeBits & (1<<i) && 
             (gpuMemProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)==
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT){
+            (VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)){
                 allocInfo.memoryTypeIndex=i;
             }
         }
@@ -524,16 +544,119 @@ bool vk_init(VkContext *vkcontext, void *window){
 
         VK_CHECK(vkBeginCommandBuffer(cmd,&cmdBeginInfo));
 
+        VkImageSubresourceRange range={};
+        range.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+        range.layerCount=1;
+        range.levelCount=1;
+
+        //transition layout to transfer optimal
+        VkImageMemoryBarrier imgMemBarrier={};
+        imgMemBarrier.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        imgMemBarrier.image=vkcontext->image.image;
+        imgMemBarrier.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+        imgMemBarrier.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        imgMemBarrier.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        imgMemBarrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+        imgMemBarrier.subresourceRange=range;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,0,0,0,
+            1,&imgMemBarrier);
+        
+
         VkBufferImageCopy copyRegion={};
         copyRegion.imageExtent={data->header.Width,data->header.Height,1};
         copyRegion.imageSubresource.layerCount=1;
         copyRegion.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
 
         vkCmdCopyBufferToImage(cmd,vkcontext->stagingBuffer.buffer,vkcontext->image.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copyRegion);
+        
+        imgMemBarrier.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        imgMemBarrier.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imgMemBarrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+        imgMemBarrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        imgMemBarrier.subresourceRange=range;
+
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,0,0,0,0,
+            1,&imgMemBarrier);
+        
         VK_CHECK(vkEndCommandBuffer(cmd));
-        vkDeviceWaitIdle(vkcontext->device);
+
+        VkFence uploadFence;
+        VkFenceCreateInfo fenceInfo={};
+        fenceInfo.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceInfo.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+
+        VK_CHECK(vkCreateFence(vkcontext->device,&fenceInfo,0,&uploadFence));
+
+        VkSubmitInfo submitInfo=createSubmitInfo(&cmd);
+
+        
+        VK_CHECK(vkQueueSubmit(vkcontext->graphicsQueue,1,&submitInfo,uploadFence));
+        vkWaitForFences(vkcontext->device,1,&uploadFence,true,UINT64_MAX);
+    }
+
+    //create image view
+    {
+        VkImageViewCreateInfo viewInfo={};
+        viewInfo.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image=vkcontext->image.image;
+        viewInfo.format=VK_FORMAT_R8G8B8A8_UNORM;
+        viewInfo.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.layerCount=1;
+        viewInfo.subresourceRange.levelCount=1;
+        viewInfo.viewType=VK_IMAGE_VIEW_TYPE_2D;
+
+        VK_CHECK(vkCreateImageView(vkcontext->device,&viewInfo,0,&vkcontext->image.view));
+    }
+
+    //create sampler
+    {
+        VkSamplerCreateInfo samplerInfo={};
+        samplerInfo.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.minFilter=VK_FILTER_NEAREST;//pixel, no interpolate
+        samplerInfo.magFilter=VK_FILTER_NEAREST;
+        vkCreateSampler(vkcontext->device,&samplerInfo,0,&vkcontext->sampler);
+    }
+
+    //create descriptor pool
+    {
+        VkDescriptorPoolSize poolSize={};
+        poolSize.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount=1;
+
+        VkDescriptorPoolCreateInfo poolInfo={};
+        poolInfo.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets=1;
+        poolInfo.poolSizeCount=1;
+        poolInfo.pPoolSizes=&poolSize;
+        VK_CHECK(vkCreateDescriptorPool(vkcontext->device,&poolInfo,0,&vkcontext->descriptorPool));
     }
     
+    //create descriptor set
+    {
+
+        VkDescriptorSetAllocateInfo allocInfo={};
+        allocInfo.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.pSetLayouts=&vkcontext->setLayout;
+        allocInfo.descriptorSetCount=1;
+        allocInfo.descriptorPool=vkcontext->descriptorPool;
+        VK_CHECK(vkAllocateDescriptorSets(vkcontext->device,&allocInfo,&vkcontext->descSet));
+    }
+
+    //update descriptor set
+    {
+        VkDescriptorImageInfo imgInfo={};
+        imgInfo.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imgInfo.imageView=vkcontext->image.view;
+        imgInfo.sampler=vkcontext->sampler;
+        VkWriteDescriptorSet write={};
+        write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet=vkcontext->descSet;
+        write.pImageInfo=&imgInfo;
+        write.dstBinding=0;
+        write.descriptorCount=1;
+        write.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        vkUpdateDescriptorSets(vkcontext->device,1,&write,0,0);
+    }
     return true;
 }
 
@@ -580,8 +703,11 @@ bool vk_render(VkContext *vkcontext){
         vkCmdSetScissor(cmd,0,1,&scissor);
         vkCmdSetViewport(cmd,0,1,&viewport);
 
+        vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,vkcontext->pipelineLayout,
+        0,1,&vkcontext->descSet,0,0);
+
         vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,vkcontext->pipeline);
-        vkCmdDraw(cmd,3,1,0,0);
+        vkCmdDraw(cmd,6,1,0,0);
     }
 
     vkCmdEndRenderPass(cmd);
