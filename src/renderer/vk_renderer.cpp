@@ -583,7 +583,7 @@ bool vk_init(VkContext *vkcontext, void *window){
         VkFence uploadFence;
         VkFenceCreateInfo fenceInfo={};
         fenceInfo.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+        //fenceInfo.flags=VK_FENCE_CREATE_SIGNALED_BIT;
 
         VK_CHECK(vkCreateFence(vkcontext->device,&fenceInfo,0,&uploadFence));
 
@@ -591,7 +591,7 @@ bool vk_init(VkContext *vkcontext, void *window){
 
         
         VK_CHECK(vkQueueSubmit(vkcontext->graphicsQueue,1,&submitInfo,uploadFence));
-        vkWaitForFences(vkcontext->device,1,&uploadFence,true,UINT64_MAX);
+        VK_CHECK(vkWaitForFences(vkcontext->device,1,&uploadFence,true,UINT64_MAX));
     }
 
     //create image view
